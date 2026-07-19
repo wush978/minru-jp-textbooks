@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import json
 import hashlib
+import time  # 引入時間模組，用來控制發送頻率
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
@@ -24,7 +25,7 @@ class PageAnalysis(BaseModel):
 # --- 2. 設定網頁外觀 ---
 st.set_page_config(page_title="小學日文課本翻譯機 (快取排版版)", layout="wide", page_icon="📚")
 st.title("📚 小學日文課本翻譯機 (快取與左右排版版)")
-st.write("已啟用「本地快取機制」與「Word 左右排版」，方便您反覆調整樣式而不再消耗 API 額度！")
+st.write("已啟用「本地快取」與「防 429 斷線重試機制」，安心處理多頁 PDF！")
 
 # --- 3. 檢查 API Key ---
 api_key = os.environ.get("GEMINI_API_KEY")
@@ -41,7 +42,7 @@ if uploaded_file is not None:
             client = genai.Client(api_key=api_key)
             pdf_bytes = uploaded_file.read()
             
-            # --- ✨ 核心功能 1：利用 PDF 內容產生 MD5 Hash，建立快取機制 ---
+            # --- 利用 PDF 內容產生 MD5 Hash，建立快取機制 ---
             pdf_hash = hashlib.md5(pdf_bytes).hexdigest()
             cache_dir = "cache_data"
             os.makedirs(cache_dir, exist_ok=True)
@@ -75,35 +76,55 @@ if uploaded_file is not None:
                 img_data = pix.tobytes("png")
                 image = Image.open(io.BytesIO(img_data))
                 
-                # --- ✨ 網頁端左右排版顯示 ---
+                # Streamlit 左右排版顯示
                 col1, col2 = st.columns([1, 1])
                 with col1:
                     st.image(image, caption=f"第 {page_num + 1} 頁", use_column_width=True)
 
                 data = None
                 
-                # 檢查是否有快取
+                # --- 檢查是否有快取 ---
                 if os.path.exists(cache_file):
                     with open(cache_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     st.info("⚡ 命中快取 (Cache Hit)！略過 API 呼叫。")
                 else:
-                    with st.spinner(f'呼叫 API 處理第 {page_num + 1} 頁中...'):
-                        response = client.models.generate_content(
-                            model='gemini-3.5-flash',
-                            contents=[image, prompt],
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                response_schema=PageAnalysis,
-                                temperature=0.1 
-                            )
-                        )
-                    data = json.loads(response.text)
-                    # 儲存到快取
-                    with open(cache_file, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    # --- 加入重試機制 (Retry Logic) ---
+                    success = False
+                    while not success:
+                        try:
+                            with st.spinner(f'呼叫 API 處理第 {page_num + 1} 頁中...'):
+                                response = client.models.generate_content(
+                                    model='gemini-3.5-flash',
+                                    contents=[image, prompt],
+                                    config=types.GenerateContentConfig(
+                                        response_mime_type="application/json",
+                                        response_schema=PageAnalysis,
+                                        temperature=0.1 
+                                    )
+                                )
+                            data = json.loads(response.text)
+                            
+                            # 儲存到快取
+                            with open(cache_file, "w", encoding="utf-8") as f:
+                                json.dump(data, f, ensure_ascii=False, indent=2)
+                            
+                            success = True # 標記成功，跳出 while 迴圈
+                            
+                            # 為了避免連續呼叫撞到 429 限制，成功後強制暫停 5 秒
+                            if page_num < total_pages - 1:
+                                time.sleep(5)
+                                
+                        except Exception as e:
+                            error_msg = str(e)
+                            # 如果錯誤訊息包含 429 或 RESOURCE_EXHAUSTED，就進入等待
+                            if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+                                st.warning("⚠️ 速度太快觸發免費額度限制，程式將自動暫停 60 秒後接續重試，請稍候...")
+                                time.sleep(60)
+                            else:
+                                raise e # 如果是其他未知的錯誤，直接報錯停止
 
-                # 網頁上的資料顯示 (放在右側)
+                # 網頁上的資料顯示
                 with col2:
                     st.markdown(f"**📝 大意：** {data.get('summary', '無')}")
                     vocab_md = "| 日文 | 念法 | 中文 |\n|---|---|---|\n"
@@ -113,33 +134,28 @@ if uploaded_file is not None:
                 
                 st.markdown("---")
 
-                # --- ✨ 核心功能 2：Word 左右排版 (隱藏框線的表格) ---
+                # --- 寫入 Word 左右排版 ---
                 doc.add_heading(f'第 {page_num + 1} 頁', level=1)
-                
-                # 建立 1 列 2 欄的表格作為排版容器
                 layout_table = doc.add_table(rows=1, cols=2)
                 layout_table.autofit = False
-                
-                # 設定左右兩邊各佔約 3.5 英吋 (避免超過 A4 邊界)
                 layout_table.columns[0].width = Inches(3.5)
                 layout_table.columns[1].width = Inches(3.5)
                 
                 left_cell = layout_table.rows[0].cells[0]
                 right_cell = layout_table.rows[0].cells[1]
                 
-                # 左側：放入圖片
+                # 左側圖片
                 left_p = left_cell.paragraphs[0]
                 left_run = left_p.add_run()
                 img_stream = io.BytesIO(img_data)
                 left_run.add_picture(img_stream, width=Inches(3.2)) 
                 
-                # 右側：放入大意
+                # 右側文字
                 right_p = right_cell.paragraphs[0]
                 right_p.add_run("📝 大意：\n").bold = True
                 right_p.add_run(data.get('summary', '') + "\n\n")
                 right_p.add_run("💡 重點單字：").bold = True
                 
-                # 右側：插入單字表格
                 vocab_list = data.get('vocabulary', [])
                 if vocab_list:
                     vocab_table = right_cell.add_table(rows=1, cols=3)
@@ -156,7 +172,6 @@ if uploaded_file is not None:
                         row_cells[1].text = v.get('reading', '')
                         row_cells[2].text = v.get('meaning', '')
                         
-                # 確保每一頁解析完後換頁 (最後一頁不換頁，避免產生空白頁)
                 if page_num < total_pages - 1:
                     doc.add_page_break() 
 
